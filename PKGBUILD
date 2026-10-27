@@ -4,7 +4,7 @@ pkgrel=1
 pkgdesc="Tienda de apps para el ecosistema BookOS — instalar, actualizar y desinstalar"
 arch=('x86_64')
 url="https://bookos.es/"
-license=('MIT')
+license=('LicenseRef-BookOS')
 depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'librsvg' 'curl' 'polkit' 'xdg-utils')
 makedepends=('rust' 'cargo' 'pkgconf' 'base-devel' 'imagemagick')
 source=()
@@ -21,15 +21,17 @@ package() {
 
   install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/bookos-store.desktop" <<EOF
 [Desktop Entry]
-Name=Bookos Store
-GenericName=Tienda de apps
+Name=Store
+Name[es]=Tienda
+GenericName=App Store
+GenericName[es]=Tienda de apps
 Comment=Instala y gestiona apps del ecosistema BookOS
 Exec=bookos-store
 Icon=bookos-store
 Type=Application
-Categories=Utility;System;PackageManager;
+Categories=System;PackageManager;
 StartupNotify=true
-StartupWMClass=Bookos Store
+StartupWMClass=bookos-store
 Keywords=apps;store;install;tienda;
 EOF
 

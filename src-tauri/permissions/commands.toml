@@ -67,3 +67,18 @@ commands.allow = ["progress"]
 identifier = "allow-fetch-release"
 description = "Allow fetch_release command"
 commands.allow = ["fetch_release"]
+
+[[permission]]
+identifier = "allow-bookos-palette-css"
+description = "Allow bookos_palette_css command"
+commands.allow = ["bookos_palette_css"]
+
+[[permission]]
+identifier = "allow-bookos-language"
+description = "Allow bookos_language command"
+commands.allow = ["bookos_language"]
+
+[[permission]]
+identifier = "allow-clear-catalog-cache"
+description = "Allow clear_catalog_cache command"
+commands.allow = ["clear_catalog_cache"]

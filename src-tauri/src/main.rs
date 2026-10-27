@@ -56,13 +56,12 @@ fn catalog_url() -> String {
 }
 
 /// Fetch catalog from server with on-disk cache (TTL 10 min). On network
-/// failure returns stale cache marked with `_stale: true`. Empty list if no
-/// cache and no network.
-fn fetch_catalog_cached() -> Vec<serde_json::Value> {
-    let mut cache_path = match dirs::cache_dir() {
-        Some(p) => p,
-        None => return Vec::new(),
-    };
+/// failure returns stale cache marked with `_stale: true`. Sin caché y sin red
+/// es un error, no una lista vacía: la interfaz tiene que poder distinguir
+/// «no hay apps publicadas» de «no se pudo preguntar».
+fn fetch_catalog_cached() -> Result<Vec<serde_json::Value>, String> {
+    let apps_de = |v: &serde_json::Value| v.get("apps").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+    let mut cache_path = dirs::cache_dir().ok_or("sin directorio de caché")?;
     cache_path.push("bookos-store");
     let _ = std::fs::create_dir_all(&cache_path);
     cache_path.push("catalog.json");
@@ -76,7 +75,7 @@ fn fetch_catalog_cached() -> Vec<serde_json::Value> {
     if fresh {
         if let Ok(s) = std::fs::read_to_string(&cache_path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                return v.get("apps").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+                return Ok(apps_de(&v));
             }
         }
     }
@@ -93,6 +92,7 @@ fn fetch_catalog_cached() -> Vec<serde_json::Value> {
     // ante un certificado inválido entregaba ambos a quien estuviera en medio.
     // `-k` solo con opt-in explícito (BOOKOS_INSECURE_TLS=1), como download_pkg.
     let insecure = std::env::var("BOOKOS_INSECURE_TLS").ok().as_deref() == Some("1");
+    let mut motivo = String::from("curl no está disponible");
     for candidate in std::iter::once(url.as_str()).chain(fallback_url.as_deref()) {
         let mut cmd = Command::new("curl");
         cmd.args(["-fsSL", "--max-time", "15",
@@ -107,12 +107,13 @@ fn fetch_catalog_cached() -> Vec<serde_json::Value> {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                     let _ = std::fs::write(&cache_path, &body);
                     eprintln!("[bookos-store] catalog ok from {} (insecure={})", candidate, insecure);
-                    return v.get("apps").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+                    return Ok(apps_de(&v));
                 }
+                motivo = format!("respuesta no válida de {}", candidate);
             } else {
+                motivo = String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("").to_string();
                 eprintln!("[bookos-store] curl {} exit={:?} stderr={}",
-                    candidate, o.status.code(),
-                    String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or(""));
+                    candidate, o.status.code(), motivo);
             }
         }
     }
@@ -120,10 +121,10 @@ fn fetch_catalog_cached() -> Vec<serde_json::Value> {
     // Stale fallback.
     if let Ok(s) = std::fs::read_to_string(&cache_path) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-            return v.get("apps").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+            return Ok(apps_de(&v));
         }
     }
-    Vec::new()
+    Err(motivo)
 }
 
 /// Package manager backend detected at runtime.
@@ -179,20 +180,61 @@ fn clear_catalog_cache() -> bool {
 }
 
 #[tauri::command]
-fn list_apps() -> serde_json::Value {
+fn list_apps() -> Result<serde_json::Value, String> {
     let pm = detect_pm();
-    let apps = fetch_catalog_cached();
+    let apps = fetch_catalog_cached()?;
     // Una sola consulta al gestor de paquetes para todo el catálogo. Antes se
     // lanzaba un proceso por app, en serie, y la rejilla no se pintaba hasta
     // que terminaban los ~30 fork+exec.
     let installed_map = installed_versions(pm);
+    let registro = leer_registro();
+    let rpm_tiempos = if pm == Pm::Dnf { rpm_install_times() } else { HashMap::new() };
+    let sufijo = match pm { Pm::Pacman => ".pkg.tar.zst", Pm::Dnf => ".rpm", Pm::Apt => ".deb" };
+    let asset_de = |a: &serde_json::Value| a["assets"].as_array()
+        .and_then(|v| v.iter().find(|x| x["name"].as_str().is_some_and(|n| n.ends_with(sufijo))))
+        .cloned();
+    let anotado_de = |pkg: &str, instalada: Option<&str>| registro.get(pkg)
+        .filter(|r| r["version"].as_str() == instalada).cloned();
+
+    // Sin registro de la tienda (instalado por dnf a mano) no hay hash con el
+    // que comparar; queda la fecha: si el archivo del servidor es posterior a
+    // la instalación, es otra compilación aunque la versión sea la misma.
+    // Un HEAD por app, en paralelo: en serie eran ~0,3 s por app.
+    let modificados: HashMap<String, u64> = std::thread::scope(|sc| {
+        let hilos: Vec<_> = apps.iter().filter_map(|a| {
+            let pkg = a["pkg"].as_str()?;
+            let inst = lookup_installed(&installed_map, pkg).filter(|v| v != MANUAL_VER)?;
+            if anotado_de(pkg, Some(&inst)).is_some() || !rpm_tiempos.contains_key(pkg) { return None; }
+            let url = asset_de(a)?["browser_download_url"].as_str()?.to_string();
+            Some((pkg.to_string(), url))
+        }).map(|(pkg, url)| sc.spawn(move || last_modified(&url).map(|t| (pkg, t)))).collect();
+        hilos.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
+    });
+
     let enriched: Vec<serde_json::Value> = apps.into_iter().map(|mut a| {
         let pkg = a["pkg"].as_str().unwrap_or("").to_string();
         let installed = lookup_installed(&installed_map, &pkg);
+        // Mismo número de versión pero otro paquete en el servidor. El registro
+        // solo vale si su versión es la instalada ahora: si se actualizó por
+        // fuera de la tienda, el hash anotado ya no describe nada.
+        let publicado = asset_de(&a)
+            .map(|x| (x["sha256"].as_str().map(str::to_lowercase), x["size"].as_u64()));
+        let anotado = anotado_de(&pkg, installed.as_deref());
+        // El tamaño se compara también porque un hash ausente o malformado en
+        // el catálogo no debe dejar pasar un paquete de otro tamaño.
+        let instalada_en = anotado.as_ref().and_then(|r| r["installed_at"].as_u64())
+            .or_else(|| rpm_tiempos.get(&pkg).copied());
+        a["changed"] = serde_json::json!(match (&anotado, publicado) {
+            (Some(r), Some((hash, size))) =>
+                hash.is_some_and(|h| r["sha256"].as_str() != Some(h.as_str()))
+                    || size.is_some_and(|t| r["size"].as_u64() != Some(t)),
+            _ => matches!((modificados.get(&pkg), instalada_en), (Some(m), Some(i)) if *m > i),
+        });
+        a["installed_at"] = serde_json::json!(instalada_en);
         a["installed"] = serde_json::json!(installed);
         a
     }).collect();
-    serde_json::json!(enriched)
+    Ok(serde_json::json!(enriched))
 }
 
 /// Volcado completo de paquetes instalados → `{nombre: versión}`, en **una**
@@ -217,6 +259,18 @@ fn installed_versions(pm: Pm) -> HashMap<String, String> {
         }
     }
     map
+}
+
+/// Hora de instalación (epoch) que guarda rpm, en una sola invocación. Es el
+/// respaldo para lo instalado fuera de la tienda; dpkg no guarda esa fecha.
+fn rpm_install_times() -> HashMap<String, u64> {
+    let out = Command::new("rpm").args(["-qa", "--qf", "%{NAME} %{INSTALLTIME}\n"]).output();
+    out.ok().filter(|o| o.status.success()).map(|o| {
+        String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| {
+            let (n, t) = l.split_once(' ')?;
+            Some((n.to_string(), t.trim().parse().ok()?))
+        }).collect()
+    }).unwrap_or_default()
 }
 
 /// Versión instalada de `pkg` según el volcado, con el mismo respaldo que antes:
@@ -313,16 +367,13 @@ fn launch_app(pkg: String) -> Result<(), String> {
         .map_err(|e| format!("No se pudo lanzar {}: {}", pkg, e))
 }
 
-/// Open the app's homepage (or BookOS site) in the browser as a fallback when
-/// no compatible binary is available for this user's distro.
+/// Abre la página de apps de BookOS cuando no hay paquete para esta distro.
+/// No se usa `html_url` del catálogo: apunta a `/store-files/<pkg>/`, un
+/// directorio sin índice que Apache responde con 403 (comprobado con curl).
+/// Tampoco existe una página por app (`/apps/<pkg>` da 404).
 #[tauri::command]
-fn open_release_page(repo: String) -> Result<(), String> {
-    let pkg = repo.rsplit('/').next().unwrap_or(&repo).to_string();
-    let url = fetch_catalog_cached().into_iter()
-        .find(|a| a["pkg"].as_str() == Some(&pkg))
-        .and_then(|a| a.get("html_url").and_then(|u| u.as_str()).map(String::from))
-        .unwrap_or_else(|| "https://bookos.es/".to_string());
-    Command::new("xdg-open").arg(&url).spawn().map(|_| ())
+fn open_release_page() -> Result<(), String> {
+    Command::new("xdg-open").arg("https://bookos.es/apps").spawn().map(|_| ())
         .map_err(|e| e.to_string())
 }
 
@@ -404,7 +455,7 @@ fn cancel_op(op_id: String) -> bool {
 /// on detected distro. If `password` is provided, uses sudo -S (custom dialog);
 /// otherwise pkexec (system dialog).
 #[tauri::command]
-async fn install_pkg_file(path: String, password: Option<String>, op_id: Option<String>) -> Result<String, String> {
+async fn install_pkg_file(path: String, pkg: Option<String>, password: Option<String>, op_id: Option<String>) -> Result<String, String> {
     let canon = std::fs::canonicalize(&path)
         .map_err(|e| format!("Archivo no existe: {} ({})", path, e))?;
     let canon_str = canon.to_string_lossy().to_string();
@@ -417,7 +468,48 @@ async fn install_pkg_file(path: String, password: Option<String>, op_id: Option<
         Pm::Apt => vec!["apt", "install", "-y", "--allow-downgrades", &canon_str],
     };
     eprintln!("[bookos-store] running: {:?}", args);
-    run_priv(&args, password.as_deref().unwrap_or(""), op_id.as_deref())
+    // Hash de lo que se entrega al instalador, no de lo que diga el catálogo
+    // después: es lo que de verdad acaba en el sistema.
+    let hash = sha256_de(&canon)?;
+    let salida = run_priv(&args, password.as_deref().unwrap_or(""), op_id.as_deref())?;
+    if let Some(pkg) = pkg.filter(|p| valid_pkg_name(p)) {
+        if let Some(version) = pkg_version(pm, &pkg) {
+            let tam = std::fs::metadata(&canon).map(|m| m.len()).unwrap_or(0);
+            anotar_instalado(&pkg, &version, &hash, tam);
+        }
+    }
+    Ok(salida)
+}
+
+/// Registro de lo que esta tienda instaló: `{pkg: {version, sha256, size, installed_at}}`. Los
+/// gestores no guardan el hash del paquete que instalaron, así que sin esto la
+/// única forma de comparar con el servidor es la versión, y un paquete
+/// reconstruido con la misma versión pasaba por actualizado.
+fn registro_path() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|d| d.join("bookos-store").join("installed.json"))
+}
+
+fn leer_registro() -> serde_json::Map<String, serde_json::Value> {
+    registro_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn anotar_instalado(pkg: &str, version: &str, sha256: &str, size: u64) {
+    let Some(path) = registro_path() else { return };
+    let mut reg = leer_registro();
+    let ahora = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    reg.insert(pkg.to_string(), serde_json::json!({
+        "version": version, "sha256": sha256, "size": size, "installed_at": ahora,
+    }));
+    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+    if let Err(e) = std::fs::write(&path, serde_json::Value::Object(reg).to_string()) {
+        eprintln!("[bookos-store] no se pudo escribir {}: {}", path.display(), e);
+    }
 }
 
 /// Install a package by NAME from configured repos (no file download).
@@ -494,6 +586,21 @@ fn get_icon(name: String) -> String {
     String::new()
 }
 
+fn sha256_de(path: &std::path::Path) -> Result<String, String> {
+    let out = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .map_err(|e| format!("No se pudo calcular el hash del paquete: {}", e))?;
+    if !out.status.success() {
+        return Err("No se pudo calcular el hash del paquete.".into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase())
+}
+
 /// Comprueba el sha256 del archivo descargado contra el que publica el catálogo.
 /// Falla cerrado: si no coincide, el llamante borra el archivo y no se instala.
 ///
@@ -506,18 +613,7 @@ fn verify_sha256(path: &std::path::Path, expected: &str) -> Result<(), String> {
     if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("El catálogo no trae un sha256 válido para este paquete.".into());
     }
-    let out = Command::new("sha256sum")
-        .arg(path)
-        .output()
-        .map_err(|e| format!("No se pudo calcular el hash del paquete: {}", e))?;
-    if !out.status.success() {
-        return Err("No se pudo calcular el hash del paquete.".into());
-    }
-    let got = String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+    let got = sha256_de(path)?;
     if got != expected {
         return Err(format!(
             "El paquete descargado no coincide con el catálogo (sha256 esperado {}…, obtenido {}…). \
@@ -619,7 +715,7 @@ async fn fetch_release(repo: String) -> Result<serde_json::Value, String> {
     let pkg = repo.rsplit('/').next().unwrap_or(&repo).to_string();
 
     // Pull from already-cached catalog first (cheap, no extra HTTP).
-    let apps = fetch_catalog_cached();
+    let apps = fetch_catalog_cached()?;
     let app = apps.into_iter().find(|a| a["pkg"].as_str() == Some(&pkg));
     let app = match app {
         Some(a) => a,
@@ -636,6 +732,18 @@ async fn fetch_release(repo: String) -> Result<serde_json::Value, String> {
         "html_url": html_url,
         "body":     app.get("notes").cloned().unwrap_or(serde_json::Value::String(String::new())),
     }))
+}
+
+/// `Last-Modified` del archivo remoto, en epoch. None si no lo manda o falla.
+fn last_modified(url: &str) -> Option<u64> {
+    let out = Command::new("curl")
+        .args(["-sIL", "--max-time", "8", "-o", "/dev/null", "-w", "%{header_json}", url])
+        .output().ok().filter(|o| o.status.success())?;
+    let v = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok()?;
+    let fecha = v.get("last-modified")?.as_array()?.last()?.as_str()?.to_string();
+    // `date` entiende el formato HTTP; evita escribir un parser de fechas.
+    let d = Command::new("date").args(["-u", "-d", &fecha, "+%s"]).output().ok()?;
+    String::from_utf8_lossy(&d.stdout).trim().parse().ok()
 }
 
 /// HEAD request via curl to discover Content-Length. Returns None on failure.
@@ -749,7 +857,33 @@ fn desactivar_zoom_por_pellizco<R: tauri::Runtime>(
     });
 }
 
+#[tauri::command]
+fn bookos_language() -> String {
+    let locale = std::env::var("LANG").unwrap_or_else(|_| "en".into());
+    let Some(home) = std::env::var_os("HOME") else {
+        return if locale.to_lowercase().starts_with("es") { "es" } else { "en" }.into();
+    };
+    let path = std::path::PathBuf::from(home).join(".config/bookos/settings.json");
+    let language = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .and_then(|settings| settings.get("AppLanguage").and_then(|value| value.as_str()).map(str::to_owned));
+    match language.as_deref() {
+        Some("es") => "es".into(),
+        Some("en") => "en".into(),
+        _ if locale.to_lowercase().starts_with("es") => "es".into(),
+        _ => "en".into(),
+    }
+}
+
 fn main() {
+    // El JavaScript de la tienda pinta listas: con el intérprete sobra. Sin JIT,
+    // 121 MB → 117 MB en reposo (PSS de los tres procesos, WebKitGTK 2.54.1).
+    // `WEBKIT_DISABLE_DMABUF_RENDERER` no se pone: aquí sube a 126 MB, porque a
+    // 960×680 y escala 2 los búferes compartidos pesan más que lo que ahorra.
+    if std::env::var_os("JSC_useJIT").is_none() {
+        std::env::set_var("JSC_useJIT", "0");
+    }
     tauri::Builder::default()
         .on_page_load(desactivar_zoom_por_pellizco)
         .plugin(tauri_plugin_dialog::init())
@@ -772,14 +906,15 @@ fn main() {
             cancel_op,
             progress,
             fetch_release,
+            bookos_language,
             detect_system_theme,
         ])
         .setup(|app| {
             use tauri::{WebviewWindowBuilder, WebviewUrl};
             let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("Bookos Store")
-                .inner_size(960.0, 680.0)
-                .min_inner_size(640.0, 480.0)
+                .inner_size(1180.0, 760.0)
+                .min_inner_size(900.0, 560.0)
                 .decorations(false)
                 .transparent(true)
                 .resizable(true)
