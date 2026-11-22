@@ -46,6 +46,333 @@ fn progress(op_id: String) -> serde_json::Value {
     serde_json::json!({ "pct": 100.0, "active": false })
 }
 
+/// Clave pública Ed25519 embebida para verificar la firma de `store.json`.
+const EMBEDDED_CATALOG_PUBKEY: &str = include_str!("../keys/catalog-pub.pem");
+
+fn non_comment_pem(raw: &str) -> Option<String> {
+    let lines: Vec<&str> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(format!("{}\n", lines.join("\n")))
+    }
+}
+
+fn active_catalog_pubkey_with(env_path: Option<&str>, embedded: &str) -> Result<Option<String>, String> {
+    if let Some(p) = env_path.map(str::trim).filter(|s| !s.is_empty()) {
+        let raw = std::fs::read_to_string(p)
+            .map_err(|e| format!("No se pudo leer BOOKOS_CATALOG_PUBKEY ({}): {}", p, e))?;
+        return non_comment_pem(&raw)
+            .map(Some)
+            .ok_or_else(|| format!("BOOKOS_CATALOG_PUBKEY ({}) está vacío o no contiene clave PEM.", p));
+    }
+    Ok(non_comment_pem(embedded))
+}
+
+fn active_catalog_pubkey() -> Result<Option<String>, String> {
+    let env_path = std::env::var("BOOKOS_CATALOG_PUBKEY").ok();
+    active_catalog_pubkey_with(env_path.as_deref(), EMBEDDED_CATALOG_PUBKEY)
+}
+
+fn parse_origin(url: &str) -> Option<(String, String)> {
+    if url.is_empty() || url.len() > 2048 {
+        return None;
+    }
+    if url.chars().any(|c| c.is_ascii_control() || c.is_whitespace()) {
+        return None;
+    }
+    let (scheme_raw, rest) = url.split_once("://")?;
+    let scheme = scheme_raw.to_ascii_lowercase();
+    if scheme != "https" && scheme != "http" {
+        return None;
+    }
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let tail = &rest[auth_end..];
+    if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
+        return None;
+    }
+    let path_only = tail.split(['?', '#']).next().unwrap_or("");
+    if tail.contains('\\')
+        || path_only.split('/').any(|seg| seg == "..")
+        || path_only.to_ascii_lowercase().contains("%2e%2e")
+    {
+        return None;
+    }
+    Some((scheme, authority.to_ascii_lowercase()))
+}
+
+fn is_local_http_origin(scheme: &str, authority: &str) -> bool {
+    if scheme != "http" {
+        return false;
+    }
+    let (host, port_ok) = match authority.split_once(':') {
+        Some((h, p)) => (h, !p.is_empty() && p.parse::<u16>().is_ok()),
+        None => (authority, true),
+    };
+    port_ok && matches!(host, "localhost" | "127.0.0.1")
+}
+
+fn trusted_store_file_url_with(
+    url: &str,
+    catalog_override: Option<&str>,
+    allow_local_http: bool,
+) -> Result<(), String> {
+    let Some((scheme, authority)) = parse_origin(url) else {
+        return Err(format!("URL no válida o insegura: {}", url));
+    };
+    if scheme == "https" && authority == "bookos.es" {
+        return Ok(());
+    }
+    if let Some(cat_url) = catalog_override.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some((cat_scheme, cat_auth)) = parse_origin(cat_url) {
+            if scheme == cat_scheme
+                && authority == cat_auth
+                && (cat_scheme == "https"
+                    || (allow_local_http && is_local_http_origin(&cat_scheme, &cat_auth)))
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!("Origen no permitido para descarga de BookOS Store: {}", url))
+}
+
+fn trusted_store_file_url(url: &str) -> Result<(), String> {
+    let override_url = std::env::var("BOOKOS_CATALOG_URL").ok();
+    let allow_local = std::env::var("BOOKOS_ALLOW_LOCAL_HTTP").ok().as_deref() == Some("1");
+    trusted_store_file_url_with(url, override_url.as_deref(), allow_local)
+}
+
+fn trusted_catalog_url(url: &str) -> Result<(), String> {
+    trusted_store_file_url(url)
+}
+
+fn is_local_http_allowed(url: &str) -> bool {
+    let allow_local = std::env::var("BOOKOS_ALLOW_LOCAL_HTTP").ok().as_deref() == Some("1");
+    if !allow_local {
+        return false;
+    }
+    parse_origin(url)
+        .map(|(s, a)| is_local_http_origin(&s, &a))
+        .unwrap_or(false)
+}
+
+fn valid_external_https_url(url: &str) -> bool {
+    if !url.starts_with("https://") || url.len() > 512 {
+        return false;
+    }
+    if url.chars().any(|c| c.is_ascii_control() || c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`' | '\\')) {
+        return false;
+    }
+    let rest = &url["https://".len()..];
+    let auth = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if auth.is_empty() || auth.contains('@') {
+        return false;
+    }
+    let (host, port_ok) = match auth.split_once(':') {
+        Some((h, p)) => (h, !p.is_empty() && p.parse::<u16>().is_ok()),
+        None => (auth, true),
+    };
+    port_ok
+        && host.contains('.')
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && !host.contains("..")
+}
+
+static SIG_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct TempDirGuard(std::path::PathBuf);
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn decode_sig_bytes(raw: &[u8]) -> Result<Vec<u8>, String> {
+    if raw.len() == 64 {
+        return Ok(raw.to_vec());
+    }
+    let s = std::str::from_utf8(raw)
+        .map_err(|_| "Firma del catálogo con formato inválido.".to_string())?;
+    let compact: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let decoded = general_purpose::STANDARD
+        .decode(compact.as_bytes())
+        .map_err(|_| "Firma del catálogo no es base64 válido.".to_string())?;
+    if decoded.len() != 64 {
+        return Err("La firma Ed25519 del catálogo tiene longitud inválida.".into());
+    }
+    Ok(decoded)
+}
+
+fn verify_ed25519_signature(payload: &[u8], sig_raw: &[u8], pubkey_pem: &str) -> Result<(), String> {
+    let sig_bytes = decode_sig_bytes(sig_raw)?;
+    let seq = SIG_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("bookos-sig-{}-{}-{}", std::process::id(), nanos, seq));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&dir)
+        .map_err(|e| format!("No se pudo crear directorio temporal para verificar firma: {}", e))?;
+    let _guard = TempDirGuard(dir.clone());
+
+    let pub_path = dir.join("pub.pem");
+    let payload_path = dir.join("payload.bin");
+    let sig_path = dir.join("sig.bin");
+    std::fs::write(&pub_path, pubkey_pem.as_bytes())
+        .map_err(|e| format!("Error escribiendo clave pública temporal: {}", e))?;
+    std::fs::write(&payload_path, payload)
+        .map_err(|e| format!("Error escribiendo catálogo temporal: {}", e))?;
+    std::fs::write(&sig_path, &sig_bytes)
+        .map_err(|e| format!("Error escribiendo firma temporal: {}", e))?;
+
+    let out = Command::new("openssl")
+        .arg("pkeyutl")
+        .arg("-verify")
+        .arg("-pubin")
+        .arg("-inkey").arg(&pub_path)
+        .arg("-rawin")
+        .arg("-in").arg(&payload_path)
+        .arg("-sigfile").arg(&sig_path)
+        .output()
+        .map_err(|e| format!("No se pudo ejecutar openssl para verificar la firma: {}", e))?;
+    if !out.status.success() {
+        return Err("La firma criptográfica del catálogo no es válida.".into());
+    }
+    Ok(())
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = y - if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn parse_iso8601_utc_epoch(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    if s.len() < 19 {
+        return None;
+    }
+    let b = s.as_bytes();
+    if b.get(4) != Some(&b'-') || b.get(7) != Some(&b'-')
+        || !matches!(b.get(10), Some(b'T') | Some(b't') | Some(b' '))
+        || b.get(13) != Some(&b':') || b.get(16) != Some(&b':')
+    {
+        return None;
+    }
+    let y: i64 = s[0..4].parse().ok()?;
+    let m: i64 = s[5..7].parse().ok()?;
+    let d: i64 = s[8..10].parse().ok()?;
+    let hh: i64 = s[11..13].parse().ok()?;
+    let mm: i64 = s[14..16].parse().ok()?;
+    let ss: i64 = s[17..19].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d)
+        || !(0..=23).contains(&hh) || !(0..=59).contains(&mm) || !(0..=59).contains(&ss)
+    {
+        return None;
+    }
+
+    let mut rest = &s[19..];
+    if let Some(after_dot) = rest.strip_prefix('.') {
+        let digits = after_dot.bytes().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 {
+            return None;
+        }
+        rest = &after_dot[digits..];
+    }
+
+    let offset_secs: i64 = if rest.is_empty() || rest.eq_ignore_ascii_case("z") {
+        0
+    } else if let Some(sign) = rest.chars().next().filter(|c| *c == '+' || *c == '-') {
+        let tz = &rest[1..];
+        let (oh, om) = if let Some((h, m_part)) = tz.split_once(':') {
+            (h.parse::<i64>().ok()?, m_part.parse::<i64>().ok()?)
+        } else if tz.len() == 4 {
+            (tz[0..2].parse::<i64>().ok()?, tz[2..4].parse::<i64>().ok()?)
+        } else if tz.len() == 2 {
+            (tz.parse::<i64>().ok()?, 0)
+        } else {
+            return None;
+        };
+        if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+            return None;
+        }
+        let mag = oh * 3600 + om * 60;
+        if sign == '+' { mag } else { -mag }
+    } else {
+        return None;
+    };
+
+    let local_epoch = days_from_civil(y, m, d) * 86400 + hh * 3600 + mm * 60 + ss;
+    u64::try_from(local_epoch - offset_secs).ok()
+}
+
+fn generated_at_epoch(v: &serde_json::Value) -> Option<u64> {
+    let g = v.get("generated_at")?;
+    if let Some(n) = g.as_u64() {
+        return Some(n);
+    }
+    if let Some(s) = g.as_str() {
+        let t = s.trim();
+        if let Ok(n) = t.parse::<u64>() {
+            return Some(n);
+        }
+        return parse_iso8601_utc_epoch(t);
+    }
+    None
+}
+
+fn check_anti_rollback(incoming: &serde_json::Value, cached: Option<&serde_json::Value>) -> Result<(), String> {
+    let Some(old) = cached else { return Ok(()); };
+    if let (Some(inc_ts), Some(old_ts)) = (generated_at_epoch(incoming), generated_at_epoch(old)) {
+        if inc_ts < old_ts {
+            return Err(format!(
+                "Catálogo rechazado por protección anti-rollback (recibido {}, local {}).",
+                inc_ts, old_ts
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sig_url_for(candidate: &str) -> String {
+    if let Some(base) = candidate.strip_suffix(".json.php") {
+        format!("{}.json.sig", base)
+    } else {
+        format!("{}.sig", candidate)
+    }
+}
+
+fn read_verified_cache(
+    cache_path: &std::path::Path,
+    sig_cache_path: &std::path::Path,
+    pubkey: Option<&str>,
+) -> Option<serde_json::Value> {
+    let payload = std::fs::read(cache_path).ok()?;
+    if let Some(pk) = pubkey {
+        let sig_bytes = std::fs::read(sig_cache_path).ok()?;
+        if verify_ed25519_signature(&payload, &sig_bytes, pk).is_err() {
+            return None;
+        }
+    }
+    serde_json::from_slice::<serde_json::Value>(&payload).ok()
+}
+
 /// Remote catalog endpoint. Single source of truth for available apps + their
 /// latest versions + asset URLs. Served by the BookOS website (PHP backend),
 /// not GitHub, so publishing a new app does not need a client recompile.
@@ -56,15 +383,21 @@ fn catalog_url() -> String {
 }
 
 /// Fetch catalog from server with on-disk cache (TTL 10 min). On network
-/// failure returns stale cache marked with `_stale: true`. Sin caché y sin red
-/// es un error, no una lista vacía: la interfaz tiene que poder distinguir
-/// «no hay apps publicadas» de «no se pudo preguntar».
+/// failure returns stale cache verified cryptographically if available.
+/// Sin caché válida y sin red es un error, no una lista vacía: la interfaz
+/// tiene que poder distinguir «no hay apps publicadas» de «no se pudo preguntar».
 fn fetch_catalog_cached() -> Result<Vec<serde_json::Value>, String> {
     let apps_de = |v: &serde_json::Value| v.get("apps").and_then(|a| a.as_array()).cloned().unwrap_or_default();
-    let mut cache_path = dirs::cache_dir().ok_or("sin directorio de caché")?;
-    cache_path.push("bookos-store");
-    let _ = std::fs::create_dir_all(&cache_path);
-    cache_path.push("catalog.json");
+    let pubkey = active_catalog_pubkey()?;
+    if pubkey.is_none() {
+        eprintln!("[bookos-store] aviso: sin clave pública embebida en catalog-pub.pem (modo transición)");
+    }
+
+    let mut cache_dir = dirs::cache_dir().ok_or("sin directorio de caché")?;
+    cache_dir.push("bookos-store");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let cache_path = cache_dir.join("catalog.json");
+    let sig_cache_path = cache_dir.join("catalog.json.sig");
 
     let fresh = std::fs::metadata(&cache_path).ok()
         .and_then(|m| m.modified().ok())
@@ -72,11 +405,15 @@ fn fetch_catalog_cached() -> Result<Vec<serde_json::Value>, String> {
         .map(|d| d.as_secs() < 600)
         .unwrap_or(false);
 
+    let cached_verified = read_verified_cache(&cache_path, &sig_cache_path, pubkey.as_deref());
+    if cache_path.exists() && cached_verified.is_none() {
+        let _ = std::fs::remove_file(&cache_path);
+        let _ = std::fs::remove_file(&sig_cache_path);
+    }
+
     if fresh {
-        if let Ok(s) = std::fs::read_to_string(&cache_path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                return Ok(apps_de(&v));
-            }
+        if let Some(ref v) = cached_verified {
+            return Ok(apps_de(v));
         }
     }
 
@@ -94,19 +431,67 @@ fn fetch_catalog_cached() -> Result<Vec<serde_json::Value>, String> {
     let insecure = std::env::var("BOOKOS_INSECURE_TLS").ok().as_deref() == Some("1");
     let mut motivo = String::from("curl no está disponible");
     for candidate in std::iter::once(url.as_str()).chain(fallback_url.as_deref()) {
+        if let Err(e) = trusted_catalog_url(candidate) {
+            motivo = e;
+            continue;
+        }
+        let local_http = is_local_http_allowed(candidate);
         let mut cmd = Command::new("curl");
-        cmd.args(["-fsSL", "--max-time", "15",
+        cmd.args(["-fsSL", "--max-time", "15", "--max-redirs", "3",
                   "-H", "Accept: application/json",
                   "-H", "User-Agent: bookos-store"]);
+        if !local_http {
+            cmd.args(["--proto", "=https", "--proto-redir", "=https"]);
+        }
         if insecure { cmd.arg("-k"); }
         cmd.arg(candidate);
         let out = cmd.output();
         if let Ok(o) = out {
             if o.status.success() {
-                let body = String::from_utf8_lossy(&o.stdout).to_string();
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                    let _ = std::fs::write(&cache_path, &body);
-                    eprintln!("[bookos-store] catalog ok from {} (insecure={})", candidate, insecure);
+                let mut sig_to_cache: Option<Vec<u8>> = None;
+                if let Some(ref pk) = pubkey {
+                    let sig_url = sig_url_for(candidate);
+                    let mut sig_cmd = Command::new("curl");
+                    sig_cmd.args(["-fsSL", "--max-time", "15", "--max-redirs", "3",
+                                  "-H", "User-Agent: bookos-store"]);
+                    if !local_http {
+                        sig_cmd.args(["--proto", "=https", "--proto-redir", "=https"]);
+                    }
+                    if insecure { sig_cmd.arg("-k"); }
+                    sig_cmd.arg(&sig_url);
+                    match sig_cmd.output() {
+                        Ok(so) if so.status.success() => {
+                            if let Err(e) = verify_ed25519_signature(&o.stdout, &so.stdout, pk) {
+                                motivo = e;
+                                eprintln!("[bookos-store] firma inválida desde {}: {}", sig_url, motivo);
+                                continue;
+                            }
+                            sig_to_cache = Some(so.stdout);
+                        }
+                        Ok(so) => {
+                            motivo = format!("no se pudo descargar la firma del catálogo ({})", sig_url);
+                            eprintln!("[bookos-store] curl {} exit={:?}", sig_url, so.status.code());
+                            continue;
+                        }
+                        Err(e) => {
+                            motivo = format!("error al descargar firma del catálogo: {}", e);
+                            continue;
+                        }
+                    }
+                }
+
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.stdout) {
+                    if let Err(e) = check_anti_rollback(&v, cached_verified.as_ref()) {
+                        motivo = e;
+                        eprintln!("[bookos-store] {}", motivo);
+                        continue;
+                    }
+                    let _ = std::fs::write(&cache_path, &o.stdout);
+                    if let Some(sb) = sig_to_cache {
+                        let _ = std::fs::write(&sig_cache_path, sb);
+                    }
+                    eprintln!("[bookos-store] catalog ok from {} (signed={}, insecure={})",
+                        candidate, pubkey.is_some(), insecure);
                     return Ok(apps_de(&v));
                 }
                 motivo = format!("respuesta no válida de {}", candidate);
@@ -118,11 +503,9 @@ fn fetch_catalog_cached() -> Result<Vec<serde_json::Value>, String> {
         }
     }
 
-    // Stale fallback.
-    if let Ok(s) = std::fs::read_to_string(&cache_path) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-            return Ok(apps_de(&v));
-        }
+    // Stale fallback (ya verificado si había clave pública).
+    if let Some(v) = cached_verified {
+        return Ok(apps_de(&v));
     }
     Err(motivo)
 }
@@ -170,10 +553,10 @@ fn detect_pm() -> Pm {
 /// Called by the Refresh button when admin publishes new versions.
 #[tauri::command]
 fn clear_catalog_cache() -> bool {
-    if let Some(mut p) = dirs::cache_dir() {
-        p.push("bookos-store");
-        p.push("catalog.json");
-        let _ = std::fs::remove_file(&p);
+    if let Some(mut dir) = dirs::cache_dir() {
+        dir.push("bookos-store");
+        let _ = std::fs::remove_file(dir.join("catalog.json"));
+        let _ = std::fs::remove_file(dir.join("catalog.json.sig"));
         return true;
     }
     false
@@ -377,6 +760,15 @@ fn open_release_page() -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    if !valid_external_https_url(&url) {
+        return Err(format!("URL externa no permitida: {}", url));
+    }
+    Command::new("xdg-open").arg(&url).spawn().map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Run privileged command. If `password` provided, uses `sudo -S` and feeds it
 /// via stdin. If empty, falls back to pkexec. If `op_id` set, registers PID for
 /// cancellation.
@@ -572,6 +964,9 @@ async fn verify_password(password: String) -> bool {
 /// sizes and falls back to scalable SVG. Returns empty string if not found.
 #[tauri::command]
 fn get_icon(name: String) -> String {
+    if !valid_pkg_name(&name) || name.contains("..") {
+        return String::new();
+    }
     let sizes = ["256x256", "512x512", "128x128", "96x96", "64x64", "48x48"];
     for sz in sizes {
         let p = format!("/usr/share/icons/hicolor/{}/apps/{}.png", sz, name);
@@ -606,8 +1001,7 @@ fn sha256_de(path: &std::path::Path) -> Result<String, String> {
 ///
 /// Esto detecta corrupción y manipulación en tránsito, pero no protege contra un
 /// servidor comprometido (el hash viaja por el mismo canal que el paquete). La
-/// defensa real es firmar los paquetes con la clave GPG de release, que ya existe
-/// pero que hoy solo se aplica a las ISO.
+/// defensa real es firmar el catálogo y/o los paquetes con clave criptográfica.
 fn verify_sha256(path: &std::path::Path, expected: &str) -> Result<(), String> {
     let expected = expected.trim().to_lowercase();
     if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -627,9 +1021,12 @@ fn verify_sha256(path: &std::path::Path, expected: &str) -> Result<(), String> {
 
 /// Download asset to ~/.cache/bookos-store/. Writes progress to OPS map for
 /// frontend to poll via `progress(op_id)`. Cancellable via cancel_op(op_id).
-/// El paquete se verifica contra el sha256 del catálogo antes de devolverlo.
+/// El paquete se verifica contra el origen permitido y el sha256 del catálogo
+/// antes de devolverlo.
 #[tauri::command]
 async fn download_pkg(url: String, filename: String, sha256: Option<String>, op_id: Option<String>) -> Result<String, String> {
+    trusted_store_file_url(&url)?;
+
     let mut dest = dirs::cache_dir().ok_or_else(|| "no cache dir".to_string())?;
     dest.push("bookos-store");
     std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
@@ -651,11 +1048,16 @@ async fn download_pkg(url: String, filename: String, sha256: Option<String>, op_
     // No degradar TLS automáticamente: solo aceptar certificados inválidos con
     // opt-in explícito por variable de entorno (nunca de forma silenciosa/memoizada).
     let insecure = std::env::var("BOOKOS_INSECURE_TLS").ok().as_deref() == Some("1");
+    let local_http = is_local_http_allowed(&url);
     let mut cmd = Command::new("curl");
-    cmd.args(["-fSL", "--silent"]);
+    cmd.args(["-fSL", "--silent", "--max-redirs", "3", "-w", "%{url_effective}"]);
+    if !local_http {
+        cmd.args(["--proto", "=https", "--proto-redir", "=https"]);
+    }
     if insecure { cmd.arg("-k"); eprintln!("[bookos-store] download_pkg using -k for {}", url); }
     cmd.arg("-o").arg(&dest).arg(&url);
-    let mut child = cmd.spawn().map_err(|e| format!("curl falló: {}", e))?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = cmd.spawn().map_err(|e| format!("curl falló: {}", e))?;
 
     let pid = child.id();
     if let Some(id) = op_id.as_deref() { track(id, pid); }
@@ -674,16 +1076,23 @@ async fn download_pkg(url: String, filename: String, sha256: Option<String>, op_
         }
     });
 
-    let status = child.wait().map_err(|e| e.to_string())?;
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
     stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = poller.join();
 
-    if !status.success() {
+    if !output.status.success() {
         if let Some(id) = op_id.as_deref() { untrack(id); }
         let _ = std::fs::remove_file(&dest);
-        if status.code().is_none() { return Err("__cancelled__".into()); }
-        return Err(format!("Descarga falló (exit {})", status.code().unwrap_or(-1)));
+        if output.status.code().is_none() { return Err("__cancelled__".into()); }
+        return Err(format!("Descarga falló (exit {})", output.status.code().unwrap_or(-1)));
     }
+    let effective_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if effective_url.is_empty() || trusted_store_file_url(&effective_url).is_err() {
+        let _ = std::fs::remove_file(&dest);
+        if let Some(id) = op_id.as_deref() { untrack(id); }
+        return Err(format!("Redirección bloqueada a origen no permitido: {}", effective_url));
+    }
+
     // Integridad antes de entregar la ruta: si el paquete no es el que el
     // catálogo dice, se borra y no llega nunca al instalador privilegiado.
     // Sin sha256 no hay nada que comparar, y el paquete iría igual a root:
@@ -736,9 +1145,15 @@ async fn fetch_release(repo: String) -> Result<serde_json::Value, String> {
 
 /// `Last-Modified` del archivo remoto, en epoch. None si no lo manda o falla.
 fn last_modified(url: &str) -> Option<u64> {
-    let out = Command::new("curl")
-        .args(["-sIL", "--max-time", "8", "-o", "/dev/null", "-w", "%{header_json}", url])
-        .output().ok().filter(|o| o.status.success())?;
+    if trusted_store_file_url(url).is_err() { return None; }
+    let local_http = is_local_http_allowed(url);
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sIL", "--max-time", "8", "--max-redirs", "3", "-o", "/dev/null", "-w", "%{header_json}"]);
+    if !local_http {
+        cmd.args(["--proto", "=https", "--proto-redir", "=https"]);
+    }
+    cmd.arg(url);
+    let out = cmd.output().ok().filter(|o| o.status.success())?;
     let v = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok()?;
     let fecha = v.get("last-modified")?.as_array()?.last()?.as_str()?.to_string();
     // `date` entiende el formato HTTP; evita escribir un parser de fechas.
@@ -748,9 +1163,14 @@ fn last_modified(url: &str) -> Option<u64> {
 
 /// HEAD request via curl to discover Content-Length. Returns None on failure.
 fn head_size(url: &str) -> Option<u64> {
+    if trusted_store_file_url(url).is_err() { return None; }
     let insecure = std::env::var("BOOKOS_INSECURE_TLS").ok().as_deref() == Some("1");
+    let local_http = is_local_http_allowed(url);
     let mut cmd = Command::new("curl");
-    cmd.args(["-sIL", "-o", "/dev/null", "-w", "%{size_download}\n%{header_json}"]);
+    cmd.args(["-sIL", "--max-redirs", "3", "-o", "/dev/null", "-w", "%{size_download}\n%{header_json}"]);
+    if !local_http {
+        cmd.args(["--proto", "=https", "--proto-redir", "=https"]);
+    }
     if insecure { cmd.arg("-k"); }
     cmd.arg(url);
     let out = cmd.output().ok()?;
@@ -898,6 +1318,7 @@ fn main() {
             verify_password,
             launch_app,
             open_release_page,
+            open_external_url,
             install_pkg_file,
             install_pkg_by_name,
             upgrade_all,
@@ -938,5 +1359,126 @@ fn bookos_palette_css() -> String {
         .map(|h| std::path::Path::new(&h).join(".config/bookos/palette.css"))
         .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_pkg_name() {
+        assert!(valid_pkg_name("bookos-store"));
+        assert!(valid_pkg_name("cuaderno-ligero_1.2+git"));
+        assert!(!valid_pkg_name(""));
+        assert!(!valid_pkg_name("-rf"));
+        assert!(!valid_pkg_name("../etc/passwd"));
+        assert!(!valid_pkg_name("foo/bar"));
+        assert!(!valid_pkg_name(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn test_trusted_store_file_url() {
+        assert!(trusted_store_file_url_with("https://bookos.es/store-files/a.deb", None, false).is_ok());
+        assert!(trusted_store_file_url_with("http://bookos.es/store-files/a.deb", None, false).is_err());
+        assert!(trusted_store_file_url_with("https://evil.com/a.deb", None, false).is_err());
+        assert!(trusted_store_file_url_with("https://bookos.es@evil.com/a.deb", None, false).is_err());
+        assert!(trusted_store_file_url_with("https://bookos.es/store-files/../etc/passwd", None, false).is_err());
+        assert!(trusted_store_file_url_with("https://bookos.es/store-files/%2e%2e/x", None, false).is_err());
+        assert!(trusted_store_file_url_with(
+            "http://127.0.0.1:8080/a.rpm",
+            Some("http://127.0.0.1:8080/store.json"),
+            false
+        ).is_err());
+        assert!(trusted_store_file_url_with(
+            "http://127.0.0.1:8080/a.rpm",
+            Some("http://127.0.0.1:8080/store.json"),
+            true
+        ).is_ok());
+        assert!(trusted_store_file_url_with(
+            "http://evil.com/a.rpm",
+            Some("http://evil.com/store.json"),
+            true
+        ).is_err());
+    }
+
+    #[test]
+    fn test_valid_external_https_url() {
+        assert!(valid_external_https_url("https://example.org/privacy"));
+        assert!(valid_external_https_url("https://codeberg.org/user/repo#readme"));
+        assert!(!valid_external_https_url("http://example.org/privacy"));
+        assert!(!valid_external_https_url("file:///etc/passwd"));
+        assert!(!valid_external_https_url("javascript:alert(1)"));
+        assert!(!valid_external_https_url("https://user@evil.com/"));
+        assert!(!valid_external_https_url("https://localhost/foo"));
+        assert!(!valid_external_https_url("https://example.org/a\"b"));
+    }
+
+    #[test]
+    fn test_ed25519_verify_and_anti_rollback() {
+        let dir = std::env::temp_dir().join(format!("bookos-test-ed25519-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = TempDirGuard(dir.clone());
+
+        let priv1 = dir.join("priv1.pem");
+        let pub1 = dir.join("pub1.pem");
+        let priv2 = dir.join("priv2.pem");
+        let pub2 = dir.join("pub2.pem");
+        let msg = dir.join("store.json");
+        let sig_raw = dir.join("store.sig");
+
+        assert!(Command::new("openssl").args(["genpkey", "-algorithm", "Ed25519", "-out"]).arg(&priv1).status().unwrap().success());
+        assert!(Command::new("openssl").args(["pkey", "-in"]).arg(&priv1).args(["-pubout", "-out"]).arg(&pub1).status().unwrap().success());
+        assert!(Command::new("openssl").args(["genpkey", "-algorithm", "Ed25519", "-out"]).arg(&priv2).status().unwrap().success());
+        assert!(Command::new("openssl").args(["pkey", "-in"]).arg(&priv2).args(["-pubout", "-out"]).arg(&pub2).status().unwrap().success());
+
+        let payload = br#"{"generated_at":1700000100,"apps":[]}"#;
+        std::fs::write(&msg, payload).unwrap();
+        assert!(Command::new("openssl")
+            .args(["pkeyutl", "-sign", "-inkey"]).arg(&priv1)
+            .args(["-rawin", "-in"]).arg(&msg)
+            .args(["-out"]).arg(&sig_raw)
+            .status().unwrap().success());
+
+        let raw_bytes = std::fs::read(&sig_raw).unwrap();
+        assert_eq!(raw_bytes.len(), 64);
+        let b64_bytes = format!("{}\n", general_purpose::STANDARD.encode(&raw_bytes)).into_bytes();
+        let pub1_pem = std::fs::read_to_string(&pub1).unwrap();
+        let pub2_pem = std::fs::read_to_string(&pub2).unwrap();
+
+        assert!(verify_ed25519_signature(payload, &raw_bytes, &pub1_pem).is_ok());
+        assert!(verify_ed25519_signature(payload, &b64_bytes, &pub1_pem).is_ok());
+
+        let mut tampered = payload.to_vec();
+        tampered[18] = b'2';
+        assert!(verify_ed25519_signature(&tampered, &b64_bytes, &pub1_pem).is_err());
+        assert!(verify_ed25519_signature(payload, &b64_bytes, &pub2_pem).is_err());
+
+        let old_v = serde_json::json!({"generated_at": 1700000100u64});
+        let same_v = serde_json::json!({"generated_at": 1700000100u64});
+        let new_v = serde_json::json!({"generated_at": 1700000200u64});
+        let stale_v = serde_json::json!({"generated_at": 1700000050u64});
+        assert!(check_anti_rollback(&same_v, Some(&old_v)).is_ok());
+        assert!(check_anti_rollback(&new_v, Some(&old_v)).is_ok());
+        assert!(check_anti_rollback(&stale_v, Some(&old_v)).is_err());
+
+        let iso_old = serde_json::json!({"generated_at": "2026-11-20T21:22:11+00:00"});
+        let iso_same_tz = serde_json::json!({"generated_at": "2026-11-20T22:22:11+01:00"});
+        let iso_new = serde_json::json!({"generated_at": "2026-11-20T21:22:12Z"});
+        let iso_stale = serde_json::json!({"generated_at": "2026-11-20T21:22:10+00:00"});
+        assert!(check_anti_rollback(&iso_same_tz, Some(&iso_old)).is_ok());
+        assert!(check_anti_rollback(&iso_new, Some(&iso_old)).is_ok());
+        assert!(check_anti_rollback(&iso_stale, Some(&iso_old)).is_err());
+    }
+
+    #[test]
+    fn test_embedded_pubkey_and_submit_url() {
+        let pk = active_catalog_pubkey_with(None, EMBEDDED_CATALOG_PUBKEY)
+            .expect("error leyendo clave embebida")
+            .expect("se esperaba clave pública Ed25519 embebida activa");
+        assert!(pk.contains("-----BEGIN PUBLIC KEY-----"));
+        assert!(pk.contains("-----END PUBLIC KEY-----"));
+        assert!(valid_external_https_url("https://developer.bookos.es/submit/"));
+    }
 }
 

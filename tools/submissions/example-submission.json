@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "pkg": "cuaderno-ligero",
+  "label": "Cuaderno Ligero",
+  "label_en": "Light Notebook",
+  "subtitle": "Notas Markdown rápidas y locales",
+  "description": "Editor minimalista de notas en Markdown pensado para funcionar sin conexión y respetar la privacidad del usuario.",
+  "description_en": "Minimalist Markdown notes editor built to work offline and respect user privacy.",
+  "category": "Oficina",
+  "author": "Ana Martín",
+  "contact_email": "ana@example.org",
+  "license": "MIT",
+  "version": "1.0.0",
+  "notes": "Primera versión estable para BookOS.",
+  "notes_en": "First stable release for BookOS.",
+  "source": {
+    "git_url": "https://codeberg.org/example/cuaderno-ligero.git",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "tag": "v1.0.0",
+    "build_system": "cargo",
+    "binary_name": "cuaderno-ligero"
+  },
+  "urls": {
+    "homepage": "https://codeberg.org/example/cuaderno-ligero",
+    "support": "https://codeberg.org/example/cuaderno-ligero/issues",
+    "privacy": "https://codeberg.org/example/cuaderno-ligero/src/branch/main/PRIVACY.md"
+  },
+  "media": {
+    "icon_path": "assets/icon.png",
+    "screenshots": [
+      "assets/screenshot-1.png"
+    ]
+  },
+  "privacy": {
+    "collects_data": false,
+    "tracking": false,
+    "network": false,
+    "data_types": []
+  },
+  "review": {
+    "requires_account": false,
+    "demo_notes": "Al abrir la aplicación se crea un cuaderno de ejemplo local.",
+    "permissions_rationale": "Solo lee y guarda archivos Markdown elegidos por el usuario."
+  }
+}

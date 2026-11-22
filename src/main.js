@@ -55,12 +55,25 @@ const assetDe = a => (a.release_assets || []).find(x => assetCompat(x, pmInfo.pm
 const iconCache = new Map();
 window.addEventListener('contextmenu', e => e.preventDefault());
 
+function trustedAssetUrl(u) {
+  if (!u || typeof u !== 'string') return '';
+  try {
+    const p = new URL(u);
+    if (p.protocol === 'https:' && p.hostname === 'bookos.es') return p.href;
+  } catch {}
+  return '';
+}
+
+const isCommunity = a => (a?.trust || 'official').toLowerCase() === 'community';
+const trustBadge = a => `<span class="trust-chip ${isCommunity(a) ? 'community' : 'official'}">${escapeHtml(i18n(isCommunity(a) ? 'trust.community' : 'trust.official'))}</span>`;
+
 async function getIcon(name, iconUrl) {
   if (iconCache.has(name)) return;
   let data = await invoke('get_icon', { name }).catch(() => '');
-  if (!data && iconUrl) {
+  const safeIconUrl = trustedAssetUrl(iconUrl);
+  if (!data && safeIconUrl) {
     // Sin icono no se rompe nada: la app sale con su inicial.
-    data = await fetch(iconUrl, { cache: 'no-store' })
+    data = await fetch(safeIconUrl, { cache: 'no-store' })
       .then(r => r.ok ? r.blob() : null)
       .then(blob => blob && new Promise(res => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.readAsDataURL(blob); }))
       .catch(() => '');
@@ -272,7 +285,7 @@ const filaHtml = (a, sub) => `
   <div class="row nav" role="button" tabindex="0" data-abrir="${escapeHtml(a.pkg)}">
     ${iconHtml(a)}
     <div class="row-text">
-      <div class="row-title">${escapeHtml(getLabel(a))}</div>
+      <div class="row-title">${escapeHtml(getLabel(a))}${isCommunity(a) ? ` <span class="trust-chip community">${escapeHtml(i18n('trust.community'))}</span>` : ''}</div>
       <div class="row-sub">${escapeHtml(sub ?? getDesc(a))}</div>
     </div>
     ${botonAccion(a, 'small')}
@@ -286,7 +299,7 @@ function paginaDescubrir() {
   // El catálogo no marca destacados: va delante lo publicado más recientemente.
   const recientes = [...allApps].sort((a, b) => (b.released || '').localeCompare(a.released || ''));
   const [d, ...resto] = recientes;
-  const shot = (d.screenshots || [])[0];
+  const shot = (d.screenshots || []).map(trustedAssetUrl).find(Boolean);
   const cats = [...new Set(allApps.map(a => a.category))];
   return cabecera(i18n('nav.discover')) + `
     <div class="hero" role="button" tabindex="0" data-abrir="${escapeHtml(d.pkg)}">
@@ -358,6 +371,15 @@ const paginaAjustes = () => `
       </div>
       ${ico('external', 16)}
     </div>
+  </div>
+  <div class="detail-card">
+    <div class="row nav" role="button" tabindex="0" data-act="ext" data-url="https://developer.bookos.es/submit/">
+      <div class="row-text">
+        <div class="row-title">${i18n('settings.submitApp')}</div>
+        <div class="row-sub">${i18n('settings.submitAppSub')}</div>
+      </div>
+      ${ico('external', 16)}
+    </div>
   </div>`;
 
 // ───── FICHA ─────
@@ -413,7 +435,7 @@ function fichaHtml(a) {
     if (a.self && !a.has_update) acciones += `<span class="row-state ok">${ico('check', 14, 2.5)}${i18n('detail.upToDate')}</span>`;
   }
 
-  const shots = a.screenshots || [];
+  const shots = (a.screenshots || []).map(trustedAssetUrl).filter(Boolean);
   const rels = a.releases || [];
   const notas = getNotes(rels[0] || a);
   const desc = getDesc(a) || i18n('detail.noDesc');
@@ -426,7 +448,7 @@ function fichaHtml(a) {
       ${iconHtml(a, 'xl')}
       <div class="app-head-text">
         <h2 class="app-name">${escapeHtml(getLabel(a))}</h2>
-        <div class="app-line">${[a.category, a.author].filter(Boolean).map(escapeHtml).join(' · ')}</div>
+        <div class="app-line">${trustBadge(a)}${[a.category, a.author].filter(Boolean).map(escapeHtml).join(' · ')}</div>
         <div class="app-actions">${acciones}</div>
       </div>
     </div>
@@ -450,14 +472,18 @@ function fichaHtml(a) {
     ${notas ? `
     <div class="section-header">${i18n('detail.whatsNew')}${a.available ? ' · ' + escapeHtml(a.available) : ''}</div>
     <div class="detail-card prose">${formatMd(notas)}</div>` : ''}
+    ${privacyHtml(a)}
     <div class="section-header">${i18n('detail.info')}</div>
     <div class="detail-card">
+      ${datoHtml(i18n('detail.origin'), escapeHtml(i18n(isCommunity(a) ? 'detail.originCommunity' : 'detail.originOfficial')))}
       ${datoHtml(i18n('detail.installedVer'), a.manual ? i18n('detail.installedManual') : a.installed ? escapeHtml(verCorta(a.installed)) : '')}
       ${datoHtml(i18n('detail.latestVer'), escapeHtml(a.available || '—'))}
       ${datoHtml(i18n('detail.released'), escapeHtml(a.released || ''))}
       ${datoHtml(i18n('detail.installedAt'), a.installed_at ? escapeHtml(new Date(a.installed_at * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })) : '')}
       ${datoHtml(i18n('detail.license'), escapeHtml(a.license || ''))}
       ${datoHtml(i18n('detail.package'), `<code>${pkg}</code>`)}
+      ${a.source_url && a.source_url.startsWith('https://') ? `<div class="row nav" role="button" tabindex="0" data-act="ext" data-url="${escapeHtml(a.source_url)}"><div class="row-text"><div class="row-title">${i18n('detail.sourceCode')}</div></div>${ico('external', 16)}</div>` : ''}
+      ${a.support_url && a.support_url.startsWith('https://') ? `<div class="row nav" role="button" tabindex="0" data-act="ext" data-url="${escapeHtml(a.support_url)}"><div class="row-text"><div class="row-title">${i18n('detail.support')}</div></div>${ico('external', 16)}</div>` : ''}
       ${a.html_url ? `<div class="row nav" role="button" tabindex="0" data-act="web" data-pkg="${pkg}"><div class="row-text"><div class="row-title">${i18n('detail.openHomepage')}</div></div>${ico('external', 16)}</div>` : ''}
     </div>
     ${rels.length > 1 ? `
@@ -474,6 +500,27 @@ function fichaHtml(a) {
         <div class="rel-notes">${n ? formatMd(n) : i18n('detail.noNotes')}</div>
       </div>`;
     }).join('')}</div>` : ''}`;
+}
+
+function privacyHtml(a) {
+  const p = a.privacy;
+  const policyUrl = (p && p.policy_url) || a.privacy_url || '';
+  if (!p && !policyUrl) return '';
+  const types = Array.isArray(p?.data_types) ? p.data_types.filter(Boolean) : [];
+  const collects = !!(p?.collects_data || types.length);
+  const tracking = !!p?.tracking;
+  const network = !!p?.network;
+  const rows = [];
+  if (p) {
+    rows.push(`<div class="row"><div class="row-text"><div class="row-title">${i18n('privacy.data')}</div></div><div class="row-val ${collects ? 'priv-warn' : 'priv-ok'}">${escapeHtml(collects ? i18n('privacy.collects', { d: types.join(', ') || i18n('privacy.unspecified') }) : i18n('privacy.none'))}</div></div>`);
+    rows.push(`<div class="row"><div class="row-text"><div class="row-title">${i18n('privacy.tracking')}</div></div><div class="row-val ${tracking ? 'priv-warn' : 'priv-ok'}">${escapeHtml(i18n(tracking ? 'privacy.trackingYes' : 'privacy.trackingNo'))}</div></div>`);
+    rows.push(`<div class="row"><div class="row-text"><div class="row-title">${i18n('privacy.network')}</div></div><div class="row-val">${escapeHtml(i18n(network ? 'privacy.networkYes' : 'privacy.networkNo'))}</div></div>`);
+  }
+  if (policyUrl && policyUrl.startsWith('https://')) {
+    rows.push(`<div class="row nav" role="button" tabindex="0" data-act="ext" data-url="${escapeHtml(policyUrl)}"><div class="row-text"><div class="row-title">${i18n('privacy.policy')}</div></div>${ico('external', 16)}</div>`);
+  }
+  if (!rows.length) return '';
+  return `<div class="section-header">${i18n('detail.privacy')}</div><div class="detail-card">${rows.join('')}</div>`;
 }
 
 // Tiny markdown: bold **x**, links, line breaks. Safer than dropping innerHTML raw.
@@ -516,14 +563,14 @@ function openLightbox(idx) {
 }
 function updateLightbox() {
   const lb = $('#lightbox');
-  const shots = currentApp.screenshots || [];
+  const shots = (currentApp.screenshots || []).map(trustedAssetUrl).filter(Boolean);
   lb.querySelector('#lb-img').src = shots[lightboxIdx] || '';
   lb.querySelector('#lb-counter').textContent = `${lightboxIdx+1} / ${shots.length}`;
   lb.querySelector('#lb-prev').style.visibility = lightboxIdx > 0 ? 'visible' : 'hidden';
   lb.querySelector('#lb-next').style.visibility = lightboxIdx < shots.length-1 ? 'visible' : 'hidden';
 }
 function stepLightbox(d) {
-  const shots = currentApp.screenshots || [];
+  const shots = (currentApp.screenshots || []).map(trustedAssetUrl).filter(Boolean);
   lightboxIdx = Math.max(0, Math.min(shots.length-1, lightboxIdx + d));
   updateLightbox();
 }
@@ -564,9 +611,12 @@ async function doInstall(app, isUpdate=false) {
     toast(i18n('noPkg', { exts: (pmInfo.exts||['.pkg.tar.zst']).join('/') }));
     return;
   }
+  const descKey = isUpdate
+    ? 'auth.descUpdate'
+    : (isCommunity(app) ? 'auth.descInstallCommunity' : 'auth.descInstall');
   const pwd = await promptAuth(
     isUpdate ? i18n('auth.titleUpdate') : i18n('auth.titleInstall'),
-    i18n(isUpdate ? 'auth.descUpdate' : 'auth.descInstall', { app: getLabel(app) }));
+    i18n(descKey, { app: getLabel(app), author: app.author || i18n('trust.community') }));
   if (pwd === null) return;
   const opId = newOpId();
   currentOpId = opId;
@@ -764,6 +814,7 @@ function accion(act, el) {
     case 'ajustes-sistema': invoke('launch_app', { pkg: 'bookos-settings' }).catch(e => toast(i18n('err', { m: errMsg(e) }))); break;
     case 'shot':       openLightbox(+el.dataset.i); break;
     case 'web':        invoke('open_release_page').catch(e => toast(i18n('err', { m: errMsg(e) }))); break;
+    case 'ext':        if (el.dataset.url) invoke('open_external_url', { url: el.dataset.url }).catch(e => toast(i18n('err', { m: errMsg(e) }))); break;
     case 'launch':     doLaunch(app); break;
     case 'uninstall':  doUninstall(app); break;
     // La barra de progreso vive en la ficha: instalar desde una fila la abre.

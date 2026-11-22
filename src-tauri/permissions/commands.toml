@@ -82,3 +82,8 @@ commands.allow = ["bookos_language"]
 identifier = "allow-clear-catalog-cache"
 description = "Allow clear_catalog_cache command"
 commands.allow = ["clear_catalog_cache"]
+
+[[permission]]
+identifier = "allow-open-external-url"
+description = "Allow open_external_url command"
+commands.allow = ["open_external_url"]
